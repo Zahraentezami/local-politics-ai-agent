@@ -19,8 +19,8 @@ The model follows an event-based approach using a standardized metadata schema c
 
 | Name | Role  |
 |---|---|
-| Nicole Blanchett | Project Lead | |
-| [Angela Misri](https://github.com/karmicangel) | Supervisor | |
-| AJ Cordeiro | Researcher | Supervisor | |
+| Nicole Blanchett | Project Lead and Researcher | |
+| [Angela Misri](https://github.com/karmicangel) | Researcher and Supervisor | |
+| AJ Cordeiro | Researcher and Supervisor | |
 | [Zahra Entezami](https://github.com/zahraentezami) | Graduate Research Assistant |  |
 | [Nujaimah Ahmed](https://github.com/nujaimah) | Graduate Research Assistant |  |
