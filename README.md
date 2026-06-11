@@ -1,7 +1,7 @@
 ![Local Politics AI Agent Logo](assets/local-politics-ai-agent-logo.png)
 
 ## About
-The Local Politics AI Agent is an AI-powered municipal issue tracking and search framework that maps council records, meeting transcripts, Documenters notes, public reports, and news coverage into evidence-based timelines. This project is within the broader Political Accountability, Transparency, and Representation Oversight Network (PATRON) project (you can find out more about the PATRON work at https://github.com/patron-rotip).
+The Local Politics AI Agent is an AI-powered municipal issue tracking and search framework that maps council records, meeting transcripts, Documenters notes, public reports, and news coverage into evidence-based timelines. This project is within the broader Political Accountability, Transparency, and Representation Oversight Network ([PATRON](https://github.com/patron-rotip)) project.
 
 The agent seeks to reconstruct the lifecycle of municipal issues across time. The project models local issues as evolving pathways that span proposals, consultations, reports, committee deliberations, council decisions, funding announcements, implementation milestones, stakeholder responses, and media coverage. Because these events are often distributed across multiple institutions, platforms, and information sources, understanding how a policy issue develops can be challenging for both citizens and journalists. The project therefore aims to improve transparency and access to municipal political processes. Initial development focuses on Toronto before expanding to other regions.
 
