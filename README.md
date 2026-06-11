@@ -12,6 +12,7 @@ The model follows an event-based approach using a standardized metadata schema c
 
 ## Communication
 [Slack](https://local-tracking-agent.slack.com)
+
 [Google Drive](https://drive.google.com/drive/folders/1rkV734LLtj0n18h7S_jkZlPlYjjGgNhC?usp=sharing)
 
 ## Team
