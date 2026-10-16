@@ -7,6 +7,7 @@ import json
 import csv
 import os
 import io
+import pandas as pd
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -27,7 +28,7 @@ TOPIC_KEYWORDS = [
 ]
 
 
-EXCEL_PATH = "INPUT_FILE" # insert file name here
+EXCEL_PATH = "Torontos-Waterfront-East-LRT.xlsx" # insert file name here
 EXCEL_SHEET = "Numerical Codes"
 
 
@@ -1223,12 +1224,12 @@ if __name__ == "__main__":
     print(f"Wrote {json_path}")
 
 
+    # Write XLSX instead of CSV
     if all_records:
-        csv_path = os.path.join(os.getcwd(), "welrt_records.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CODEBOOK_COLUMNS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(all_records)
-        print(f"Wrote {csv_path}")
+        xlsx_path = os.path.join(os.getcwd(), "welrt_records.xlsx")
+        df = pd.DataFrame(all_records)
+        df = df.reindex(columns=CODEBOOK_COLUMNS)
+        df.to_excel(xlsx_path, index=False, engine="openpyxl")
+        print(f"Wrote {xlsx_path}")
     else:
-        print("No records collected - CSV not written.")
+        print("No records collected - XLSX not written.")
