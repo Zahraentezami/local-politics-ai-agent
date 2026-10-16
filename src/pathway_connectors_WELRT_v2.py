@@ -28,7 +28,7 @@ TOPIC_KEYWORDS = [
 ]
 
 
-EXCEL_PATH = "Torontos-Waterfront-East-LRT.xlsx" # insert file name here
+EXCEL_PATH = "" # insert file name here
 EXCEL_SHEET = "Numerical Codes"
 
 
