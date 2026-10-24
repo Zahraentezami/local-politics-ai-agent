@@ -1,0 +1,1187 @@
+"""
+Sample-Corpus Civic Search Agent
+================================
+
+A reusable retrieval-and-extractive-synthesis layer for public-record corpora.
+
+Pipeline
+--------
+question
+    -> sentence-transformer query embedding
+    -> FAISS semantic retrieval
+    -> intent-aware reranking
+    -> source-diverse evidence selection
+    -> deterministic extractive synthesis
+    -> clickable author-date citations
+    -> optional query log
+
+This version does not use an LLM API.
+
+Expected index directory
+------------------------
+The index directory must contain:
+    chunks.jsonl 
+    faiss.index
+    both from(build_retrieval_index.py)
+
+The chunk records should include, at minimum:
+    chunk_text
+    document_id
+    V04_Title
+    V13_SourceLink
+
+Optional metadata fields improve ranking/citations:
+    normalized_date
+    V01_Date
+    section_name
+    V06_PolicyStage
+    V07_EventType
+    V10_SourceClass
+    V11_BodyClass
+    V16_Tier
+
+Install dependencies
+--------------------
+    pip install faiss-cpu sentence-transformers numpy
+
+Example
+-------
+    python civic_search_agent.py \
+        --index-dir ./retrieval_index \
+        --question "How has this project developed over time?"
+
+Run without --question for interactive mode.
+"""
+
+import argparse
+import json
+import os
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import faiss
+from sentence_transformers import SentenceTransformer
+
+import numpy as np
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+DEFAULT_TOP_K = 8
+DEFAULT_RERANK_CANDIDATE_MULTIPLIER = 15
+DEFAULT_MIN_TOP_SEMANTIC_SCORE = 0.30
+
+DEFAULT_MAX_SYNTHESIS_SOURCES = 7
+DEFAULT_MAX_SENTENCES_PER_SOURCE = 3
+DEFAULT_MAX_TIMELINE_EVENTS = 10
+
+DEFAULT_QUERY_LOG_FILE = "agent_query_log.jsonl"
+
+AGENT_VERSION = "1.0.0-extractive"
+
+# Optional domain -> author mapping used for clickable author-date citations.
+# Extend or replace this dictionary for another jurisdiction/corpus.
+DEFAULT_AUTHOR_MAP = {
+    "secure.toronto.ca": "City of Toronto",
+    "www.toronto.ca": "City of Toronto",
+    "toronto.ca": "City of Toronto",
+    "www.ttc.ca": "Toronto Transit Commission",
+    "ttc.ca": "Toronto Transit Commission",
+    "www.waterfrontoronto.ca": "Waterfront Toronto",
+    "waterfrontoronto.ca": "Waterfront Toronto",
+    "stevemunro.ca": "Munro",
+    "www.stevemunro.ca": "Munro",
+}
+
+def safe_text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def source_domain(url):
+    try:
+        return urlparse(safe_text(url)).netloc.lower()
+    except Exception:
+        return ""
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Settings:
+    index_dir: Path
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    top_k: int = DEFAULT_TOP_K
+    rerank_candidate_multiplier: int = DEFAULT_RERANK_CANDIDATE_MULTIPLIER
+    min_top_semantic_score: float = DEFAULT_MIN_TOP_SEMANTIC_SCORE
+    max_synthesis_sources: int = DEFAULT_MAX_SYNTHESIS_SOURCES
+    max_sentences_per_source: int = DEFAULT_MAX_SENTENCES_PER_SOURCE
+    max_timeline_events: int = DEFAULT_MAX_TIMELINE_EVENTS
+    query_log_file: str = DEFAULT_QUERY_LOG_FILE
+    enable_query_log: bool = True
+    author_map: dict = None
+
+    def __post_init__(self):
+        if self.author_map is None:
+            self.author_map = dict(DEFAULT_AUTHOR_MAP)
+
+
+def load_json_config(path):
+    if not path:
+        return {}
+
+    config_path = Path(path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_settings(args):
+    cfg = load_json_config(args.config)
+
+    index_value = args.index_dir or cfg.get("index_dir", "")
+
+    if not index_value:
+        raise ValueError(
+            "An index directory is required. Use --index-dir PATH "
+            "or provide index_dir in a JSON config file."
+        )
+
+    author_map = dict(DEFAULT_AUTHOR_MAP)
+    author_map.update(cfg.get("author_map", {}))
+
+    return Settings(
+        index_dir=Path(index_value).expanduser().resolve(),
+        embedding_model=cfg.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+        top_k=int(cfg.get("top_k", DEFAULT_TOP_K)),
+        rerank_candidate_multiplier=int(
+            cfg.get(
+                "rerank_candidate_multiplier",
+                DEFAULT_RERANK_CANDIDATE_MULTIPLIER,
+            )
+        ),
+        min_top_semantic_score=float(
+            cfg.get(
+                "min_top_semantic_score",
+                DEFAULT_MIN_TOP_SEMANTIC_SCORE,
+            )
+        ),
+        max_synthesis_sources=int(
+            cfg.get(
+                "max_synthesis_sources",
+                DEFAULT_MAX_SYNTHESIS_SOURCES,
+            )
+        ),
+        max_sentences_per_source=int(
+            cfg.get(
+                "max_sentences_per_source",
+                DEFAULT_MAX_SENTENCES_PER_SOURCE,
+            )
+        ),
+        max_timeline_events=int(
+            cfg.get(
+                "max_timeline_events",
+                DEFAULT_MAX_TIMELINE_EVENTS,
+            )
+        ),
+        query_log_file=cfg.get(
+            "query_log_file",
+            DEFAULT_QUERY_LOG_FILE,
+        ),
+        enable_query_log=not args.no_log,
+        author_map=author_map,
+    )
+
+
+DECISION_QUERY_TERMS = {
+    "decision", "decisions", "approved", "approval", "adopted",
+    "adoption", "vote", "voted", "motion", "motions", "council",
+    "committee", "directed", "direction", "authorized",
+    "authorization", "funding",
+}
+
+STAKEHOLDER_QUERY_TERMS = {
+    "stakeholder", "stakeholders", "reaction", "reactions", "responded",
+    "response", "criticized", "criticism", "support", "opposition",
+    "consultation", "public", "resident", "residents", "community",
+}
+
+TIMELINE_QUERY_TERMS = {
+    "timeline", "history", "historical", "developed", "development",
+    "evolved", "evolution", "progressed", "progress", "over", "time",
+    "chronology", "chronological", "milestone", "milestones",
+}
+
+
+def classify_query_intent(query):
+    q = safe_text(query).lower()
+    tokens = set(re.findall(r"[a-z]+", q))
+
+    decision_hits = len(tokens & DECISION_QUERY_TERMS)
+    stakeholder_hits = len(tokens & STAKEHOLDER_QUERY_TERMS)
+    timeline_hits = len(tokens & TIMELINE_QUERY_TERMS)
+
+    # Strong phrase-level timeline cues.
+    timeline_phrases = [
+        "over time",
+        "how has",
+        "how did",
+        "timeline",
+        "history of",
+        "developed",
+        "evolved",
+        "progressed",
+    ]
+
+    if any(p in q for p in timeline_phrases) and timeline_hits > 0:
+        return "timeline"
+
+    if decision_hits > stakeholder_hits and decision_hits > 0:
+        return "decision"
+
+    if stakeholder_hits > decision_hits and stakeholder_hits > 0:
+        return "stakeholder"
+
+    return "general"
+
+
+OFFICIAL_DOMAINS = set(DEFAULT_AUTHOR_MAP.keys())
+
+
+def count_stakeholder_evidence_hits(record):
+    section = safe_text(record.get("section_name", "")).lower()
+    chunk_text = safe_text(record.get("chunk_text", "")).lower()
+
+    strong_terms = [
+        "stakeholder advisory committee",
+        "public consultation",
+        "public workshop",
+        "community liaison committee",
+        "residents association",
+        "resident association",
+        "neighbourhood association",
+        "neighborhood association",
+        "business improvement area",
+        "letter from",
+        "e-mail from",
+        "email from",
+        "submission from",
+        "petition from",
+        "concern",
+        "concerns",
+        "opposition",
+        "feedback",
+        "public input",
+        "public meeting",
+    ]
+
+    section_terms = [
+        "consultation",
+        "communications",
+        "speaker",
+        "speakers",
+    ]
+
+    hits = sum(1 for term in strong_terms if term in chunk_text)
+    hits += sum(1 for term in section_terms if term in section)
+    return hits
+
+
+def count_decision_evidence_hits(record):
+    section = safe_text(record.get("section_name", "")).lower()
+    chunk_text = safe_text(record.get("chunk_text", "")).lower()
+
+    hits = 0
+
+    decision_sections = {
+        "city council decision",
+        "committee decision",
+        "committee recommendations",
+        "recommendations",
+        "recommendation",
+        "motions",
+        "motion",
+        "motions (committee)",
+        "motions (city council)",
+        "votes",
+        "vote",
+    }
+
+    if section in decision_sections:
+        hits += 2
+
+    strong_terms = [
+        "city council adopted",
+        "city council approve",
+        "city council approved",
+        "city council direct",
+        "city council authorized",
+        "council adopted",
+        "council approved",
+        "committee recommends",
+        "executive committee recommends",
+        "authorized",
+        "authorization",
+        "funding and direction",
+        "recommendations were subsequently adopted",
+    ]
+
+    hits += sum(1 for term in strong_terms if term in chunk_text)
+    return hits
+
+
+def source_authority_bonus(record, query_intent, settings):
+    url = safe_text(record.get("V13_SourceLink", ""))
+    domain = source_domain(url)
+    title = safe_text(record.get("V04_Title", "")).lower()
+    section = safe_text(record.get("section_name", "")).lower()
+    tier = safe_text(record.get("V16_Tier", "")).lower()
+    source_class = safe_text(record.get("V10_SourceClass", ""))
+
+    official = domain in settings.author_map
+    bonus = 0.0
+
+    if query_intent == "decision":
+        decision_hits = count_decision_evidence_hits(record)
+
+        formal_decision_sections = {
+            "city council decision",
+            "committee decision",
+            "committee recommendations",
+            "recommendations",
+            "recommendation",
+            "motions",
+            "motion",
+            "motions (committee)",
+            "motions (city council)",
+            "votes",
+            "vote",
+        }
+
+        bonus += min(decision_hits * 0.020, 0.060)
+
+        if domain == "secure.toronto.ca":
+            bonus += 0.060
+            if section in formal_decision_sections:
+                bonus += 0.035
+        elif official and ("backgroundfile" in url.lower() or ".pdf" in url.lower()):
+            bonus += 0.025
+        elif official:
+            bonus += 0.005
+
+        if source_class == "1":
+            bonus += 0.015
+        elif source_class == "2":
+            bonus += 0.005
+
+        if "p0" in tier:
+            bonus += 0.010
+
+        if "background" in title and domain != "secure.toronto.ca":
+            bonus -= 0.030
+
+    elif query_intent == "stakeholder":
+        stakeholder_hits = count_stakeholder_evidence_hits(record)
+
+        if any(
+            term in section
+            for term in ["consultation", "communications", "speaker", "speakers"]
+        ):
+            bonus += 0.040
+
+        bonus += min(stakeholder_hits * 0.015, 0.075)
+
+        if any(term in title for term in ["consultation", "stakeholder", "community"]):
+            bonus += 0.015
+
+        if official and stakeholder_hits > 0:
+            bonus += 0.005
+
+        if stakeholder_hits == 0:
+            bonus -= 0.040
+
+        if section == "attendance" and stakeholder_hits < 2:
+            bonus -= 0.020
+
+    else:
+        if official:
+            bonus += 0.015
+
+        if "p0" in tier:
+            bonus += 0.010
+
+        if source_class == "1":
+            bonus += 0.010
+        elif source_class == "2":
+            bonus += 0.005
+
+    return bonus
+
+
+def load_chunks(index_dir):
+    path = index_dir / "chunks.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing chunks file: {path}")
+
+    records = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def load_retrieval_system(settings):
+    index_dir = settings.index_dir
+
+    chunks = load_chunks(index_dir)
+
+    faiss_path = index_dir / "faiss.index"
+    if not faiss_path.exists():
+        raise FileNotFoundError(f"Missing FAISS index: {faiss_path}")
+
+    index = faiss.read_index(str(faiss_path))
+
+    if index.ntotal != len(chunks):
+        raise ValueError(
+            "FAISS/chunk mismatch: "
+            f"{index.ntotal} vectors vs {len(chunks)} chunk rows."
+        )
+
+    model = SentenceTransformer(settings.embedding_model)
+    return model, index, chunks
+
+
+def retrieve_evidence(question, model, index, chunk_records, settings):
+    question = safe_text(question)
+    if not question:
+        return "general", []
+
+    intent = classify_query_intent(question)
+
+    query_embedding = model.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype("float32")
+
+    candidate_k = min(
+        max(settings.top_k * settings.rerank_candidate_multiplier, settings.top_k),
+        len(chunk_records),
+    )
+
+    scores, indices = index.search(query_embedding, candidate_k)
+
+    candidates = []
+
+    for semantic_score, idx in zip(scores[0], indices[0]):
+        if idx < 0:
+            continue
+
+        record = dict(chunk_records[int(idx)])
+        bonus = source_authority_bonus(record, intent, settings)
+
+        record["semantic_score"] = float(semantic_score)
+        record["rerank_bonus"] = float(bonus)
+        record["retrieval_score"] = float(semantic_score + bonus)
+
+        candidates.append(record)
+
+    candidates.sort(
+        key=lambda record: record["retrieval_score"],
+        reverse=True,
+    )
+
+    max_per_document = 1 if intent in {"decision", "stakeholder", "timeline"} else 2
+
+    selected = []
+    per_document = defaultdict(int)
+
+    for record in candidates:
+        document_id = safe_text(record.get("document_id", ""))
+
+        if per_document[document_id] >= max_per_document:
+            continue
+
+        selected.append(record)
+        per_document[document_id] += 1
+
+        if len(selected) >= settings.top_k:
+            break
+
+    return intent, selected
+
+
+def make_evidence_bundle(records):
+    blocks = []
+    citation_map = {}
+
+    for number, record in enumerate(records, start=1):
+        source_id = f"S{number}"
+        citation_map[source_id] = record
+
+        date = (
+            safe_text(record.get("normalized_date", ""))
+            or safe_text(record.get("V01_Date", ""))
+        )
+
+        block = f"""
+[{source_id}]
+Title: {safe_text(record.get("V04_Title", ""))}
+Date: {date}
+Section: {safe_text(record.get("section_name", ""))}
+Policy stage: {safe_text(record.get("V06_PolicyStage", ""))}
+Event type: {safe_text(record.get("V07_EventType", ""))}
+Source class: {safe_text(record.get("V10_SourceClass", ""))}
+Body class: {safe_text(record.get("V11_BodyClass", ""))}
+Source URL: {safe_text(record.get("V13_SourceLink", ""))}
+Semantic score: {record.get("semantic_score", 0):.4f}
+Retrieval score: {record.get("retrieval_score", 0):.4f}
+Evidence:
+{safe_text(record.get("chunk_text", ""))}
+""".strip()
+
+        blocks.append(block)
+
+    return "\n\n---\n\n".join(blocks), citation_map
+
+
+def split_sentences(text):
+    """
+    Lightweight sentence splitter for already-normalized civic text.
+    """
+    text = safe_text(text)
+    if not text:
+        return []
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    parts = re.split(
+        r"(?<=[.!?])\s+(?=[A-Z0-9])",
+        text,
+    )
+
+    return [
+        p.strip()
+        for p in parts
+        if len(p.strip().split()) >= 6
+    ]
+
+
+def query_keywords(question):
+    stop = {
+        "what", "when", "where", "which", "who", "whom", "whose",
+        "how", "has", "have", "had", "did", "does", "do", "was",
+        "were", "is", "are", "the", "a", "an", "of", "to", "for",
+        "and", "or", "in", "on", "with", "about", "over", "time",
+    }
+
+    return {
+        token
+        for token in re.findall(
+            r"[a-z0-9]+",
+            safe_text(question).lower(),
+        )
+        if len(token) > 2 and token not in stop
+    }
+
+
+def sentence_relevance_score(sentence, question, intent):
+    lower = sentence.lower()
+    qwords = query_keywords(question)
+
+    score = sum(
+        1
+        for word in qwords
+        if word in lower
+    )
+
+    if re.search(r"\b(?:19|20)\d{2}\b", sentence):
+        score += 1.5
+
+    if intent == "timeline":
+        timeline_signals = [
+            "in january", "in february", "in march", "in april",
+            "in may", "in june", "in july", "in august",
+            "in september", "in october", "in november", "in december",
+            "city council", "reported", "approved", "advanced",
+            "completed", "funding", "design", "update",
+        ]
+        score += sum(0.5 for term in timeline_signals if term in lower)
+
+    elif intent == "decision":
+        score += sum(
+            0.7
+            for term in [
+                "city council", "approved", "adopted", "authorized",
+                "directed", "recommend", "motion", "funding",
+            ]
+            if term in lower
+        )
+
+    elif intent == "stakeholder":
+        score += sum(
+            0.7
+            for term in [
+                "stakeholder", "public", "consultation", "resident",
+                "community", "concern", "opposition", "feedback",
+                "letter", "speaker",
+            ]
+            if term in lower
+        )
+
+    return score
+
+
+def select_relevant_sentences(record, question, intent, max_sentences=3):
+    sentences = split_sentences(
+        record.get("chunk_text", "")
+    )
+
+    if not sentences:
+        return []
+
+    scored = [
+        (
+            sentence_relevance_score(
+                sentence,
+                question,
+                intent,
+            ),
+            i,
+            sentence,
+        )
+        for i, sentence in enumerate(sentences)
+    ]
+
+    scored.sort(
+        key=lambda x: (x[0], -x[1]),
+        reverse=True,
+    )
+
+    chosen = [
+        sentence
+        for score, _, sentence in scored
+        if score > 0
+    ][:max_sentences]
+
+    # If keyword scoring finds nothing, keep the first substantive sentences.
+    if not chosen:
+        chosen = sentences[:max_sentences]
+
+    # Restore original order for readability.
+    positions = {
+        sentence: sentences.index(sentence)
+        for sentence in chosen
+    }
+
+    chosen.sort(
+        key=lambda sentence: positions[sentence]
+    )
+
+    return chosen
+
+
+def extract_event_year(sentence, record):
+    """
+    Prefer an event year explicitly stated in the sentence.
+    Fall back to document metadata only for ordering when necessary.
+    """
+    years = re.findall(
+        r"\b(?:19|20)\d{2}\b",
+        sentence,
+    )
+
+    if years:
+        return int(years[0])
+
+    meta_year = get_citation_year(record)
+
+    if meta_year.isdigit():
+        return int(meta_year)
+
+    return 9999
+
+
+def clickable_citation(record, settings):
+    label = citation_label(record, settings)
+    url = safe_text(
+        record.get(
+            "V13_SourceLink",
+            ""
+        )
+    )
+
+    if url:
+        return f"[{label}]({url})"
+
+    return f"({label})"
+
+
+def build_timeline_answer(question, evidence_records, settings):
+    """
+    Deterministic chronology built from retrieved sentences.
+    No free-form factual generation is used.
+    """
+    events = []
+    seen = set()
+
+    for record in evidence_records[:settings.max_synthesis_sources]:
+        sentences = select_relevant_sentences(
+            record,
+            question,
+            "timeline",
+            max_sentences=settings.max_sentences_per_source,
+        )
+
+        for sentence in sentences:
+            normalized = re.sub(
+                r"\W+",
+                " ",
+                sentence.lower(),
+            ).strip()
+
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+
+            events.append({
+                "year": extract_event_year(
+                    sentence,
+                    record,
+                ),
+                "sentence": sentence,
+                "record": record,
+            })
+
+    events.sort(
+        key=lambda item: (
+            item["year"],
+            safe_text(
+                item["record"].get(
+                    "V01_Date",
+                    ""
+                )
+            ),
+        )
+    )
+
+    events = events[:settings.max_timeline_events]
+
+    if not events:
+        return (
+            "The available corpus does not contain enough "
+            "retrievable evidence to construct a timeline."
+        )
+
+    lines = [
+        "The retrieved record shows the topic developing through a series of "
+        "planning, decision, implementation, and reporting steps rather "
+        "than a single event."
+    ]
+
+    for event in events:
+        sentence = event["sentence"].strip()
+        citation = clickable_citation(
+            event["record"],
+            settings,
+        )
+
+        lines.append(
+            f"{sentence} {citation}"
+        )
+
+    lines.append(
+        "Taken together, these retrieved records show a progression from "
+        "planning and preliminary design, through more detailed design and "
+        "Council authorization, toward implementation-related work. "
+        "This summary reflects only the evidence retrieved from the current corpus."
+    )
+
+    return "\n\n".join(lines)
+
+
+def build_discursive_extractive_answer(
+    question,
+    intent,
+    evidence_records,
+    settings,
+):
+    """
+    More readable answer built only from retrieved sentences plus
+    fixed connective language.
+
+    It is extractive, not generative: factual content comes directly
+    from retrieved chunks.
+    """
+    if intent == "timeline":
+        return build_timeline_answer(
+            question,
+            evidence_records,
+            settings,
+        )
+
+    intro_map = {
+        "decision": (
+            "The retrieved records identify several formal decisions and "
+            "directions relevant to this question."
+        ),
+        "stakeholder": (
+            "The retrieved records show several stakeholder reactions, "
+            "consultation points, and public-facing concerns relevant to this question."
+        ),
+        "general": (
+            "The retrieved corpus contains several pieces of evidence relevant "
+            "to this question."
+        ),
+    }
+
+    paragraphs = [
+        intro_map.get(
+            intent,
+            intro_map["general"],
+        )
+    ]
+
+    for record in evidence_records[:settings.max_synthesis_sources]:
+        sentences = select_relevant_sentences(
+            record,
+            question,
+            intent,
+            max_sentences=settings.max_sentences_per_source,
+        )
+
+        if not sentences:
+            continue
+
+        citation = clickable_citation(
+            record,
+            settings,
+        )
+
+        paragraph = " ".join(
+            sentences
+        )
+
+        paragraphs.append(
+            f"{paragraph} {citation}"
+        )
+
+    paragraphs.append(
+        "This answer is based only on the retrieved corpus evidence; "
+        "it does not add information from outside sources."
+    )
+
+    return "\n\n".join(
+        paragraphs
+    )
+
+
+def generate_grounded_answer(
+    question,
+    intent,
+    evidence_bundle,
+    evidence_records,
+    settings,
+):
+    """
+    Retrieval-only extractive synthesis mode.
+
+    No OpenAI API call is made. The answer is assembled from selected
+    sentences in retrieved evidence plus fixed connective language.
+    """
+    if not evidence_records:
+        return (
+            "The available corpus does not contain retrievable "
+            "evidence for this question."
+        )
+
+    return build_discursive_extractive_answer(
+        question,
+        intent,
+        evidence_records,
+        settings,
+    )
+
+
+CITATION_PATTERN = re.compile(r"\[(S\d+)\]")
+
+
+def validate_citations(answer, citation_map):
+    """
+    In extractive-synthesis mode citations are inserted directly from
+    trusted corpus metadata, so no model-generated citation IDs need validation.
+    """
+    if not safe_text(answer):
+        raise ValueError("Empty answer generated.")
+
+
+def get_corporate_author(record, settings):
+    """
+    Derive an author/organization label deterministically.
+
+    Domain mappings come from settings.author_map. Unmapped sources fall
+    back to a shortened document title.
+    """
+    url = safe_text(record.get("V13_SourceLink", ""))
+    domain = source_domain(url)
+
+    if domain in settings.author_map:
+        return settings.author_map[domain]
+
+    title = safe_text(record.get("V04_Title", ""))
+
+    if title:
+        title = re.sub(
+            r"\s+[|–—-]\s+[^|–—-]+$",
+            "",
+            title,
+        ).strip()
+
+        if len(title) > 45:
+            title = title[:42].rstrip() + "..."
+
+        return title
+
+    return "Source"
+
+
+def get_citation_year(record):
+    """
+    Return a four-digit year from source/document metadata only.
+    """
+    date = (
+        safe_text(record.get("normalized_date", ""))
+        or safe_text(record.get("V01_Date", ""))
+    )
+
+    match = re.search(r"\b(?:19|20)\d{2}\b", date)
+
+    if match:
+        return match.group(0)
+
+    return "n.d."
+
+
+def citation_label(record, settings):
+    """
+    Author-date label used for clickable in-text citations.
+    """
+    return f"{get_corporate_author(record, settings)}, {get_citation_year(record)}"
+
+
+def render_inline_links(answer, citation_map):
+    """
+    Citations are already inserted deterministically during extractive synthesis.
+    """
+    return answer
+
+
+def write_query_log(
+    settings,
+    question,
+    intent,
+    evidence,
+    raw_answer,
+    rendered_answer,
+):
+    if not settings.enable_query_log:
+        return
+
+    path = settings.index_dir / settings.query_log_file
+
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "agent_version": AGENT_VERSION,
+        "agent_model": "DISABLED_RETRIEVAL_ONLY",
+        "embedding_model": settings.embedding_model,
+        "question": question,
+        "intent": intent,
+        "retrieved_evidence": [
+            {
+                "rank": rank,
+                "chunk_id": record.get("chunk_id"),
+                "document_id": record.get("document_id"),
+                "title": record.get("V04_Title"),
+                "section": record.get("section_name"),
+                "url": record.get("V13_SourceLink"),
+                "citation_label": citation_label(record, settings),
+                "semantic_score": record.get("semantic_score"),
+                "retrieval_score": record.get("retrieval_score"),
+            }
+            for rank, record in enumerate(evidence, start=1)
+        ],
+        "raw_answer": raw_answer,
+        "rendered_answer": rendered_answer,
+    }
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def answer_question(question, model, index, chunks, settings):
+    intent, evidence = retrieve_evidence(
+        question,
+        model,
+        index,
+        chunks,
+        settings,
+    )
+
+    if not evidence:
+        return (
+            "The available corpus does not contain retrievable evidence "
+            "for this question."
+        )
+
+    top_semantic_score = max(
+        record["semantic_score"]
+        for record in evidence
+    )
+
+    if top_semantic_score < settings.min_top_semantic_score:
+        return (
+            "The available corpus does not contain sufficiently relevant "
+            "evidence to answer this question reliably."
+        )
+
+    evidence_bundle, citation_map = make_evidence_bundle(evidence)
+
+    raw_answer = generate_grounded_answer(
+        question,
+        intent,
+        evidence_bundle,
+        evidence_records=evidence,
+        settings=settings,
+    )
+
+    validate_citations(
+        raw_answer,
+        citation_map,
+    )
+
+    rendered_answer = render_inline_links(
+        raw_answer,
+        citation_map,
+    )
+
+    write_query_log(
+        settings,
+        question,
+        intent,
+        evidence,
+        raw_answer,
+        rendered_answer,
+    )
+
+    return rendered_answer
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Closed-corpus civic search agent with deterministic "
+            "extractive synthesis and clickable citations."
+        )
+    )
+
+    parser.add_argument(
+        "--index-dir",
+        type=str,
+        default="",
+        help="Directory containing chunks.jsonl and faiss.index.",
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="Optional JSON configuration file.",
+    )
+
+    parser.add_argument(
+        "--question",
+        "-q",
+        type=str,
+        default="",
+        help="Ask one question and exit; omit for interactive mode.",
+    )
+
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable JSONL query logging.",
+    )
+
+    args = parser.parse_args()
+
+    settings = build_settings(args)
+
+    print("Loading retrieval system...")
+    print(f"Index directory: {settings.index_dir}")
+
+    model, index, chunks = load_retrieval_system(settings)
+
+    print(f"Loaded {len(chunks)} chunks.")
+    print(
+        "Answer mode: deterministic extractive synthesis "
+        "(no LLM API required)"
+    )
+
+    if args.question:
+        answer = answer_question(
+            args.question,
+            model,
+            index,
+            chunks,
+            settings,
+        )
+        print("\n" + answer)
+        return
+
+    print("\nInteractive mode. Type 'exit' to quit.")
+
+    while True:
+        question = input("\nQuestion: ").strip()
+
+        if question.lower() in {"exit", "quit", "q"}:
+            break
+
+        if not question:
+            continue
+
+        try:
+            answer = answer_question(
+                question,
+                model,
+                index,
+                chunks,
+                settings,
+            )
+
+            print("\nAnswer:\n")
+            print(answer)
+
+        except Exception as exc:
+            print(
+                "\nERROR:",
+                type(exc).__name__,
+                str(exc),
+            )
+
+
+if __name__ == "__main__":
+    main()
