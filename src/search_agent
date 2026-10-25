@@ -11,11 +11,10 @@ question
     -> FAISS semantic retrieval
     -> intent-aware reranking
     -> source-diverse evidence selection
-    -> deterministic extractive synthesis
+    -> deterministic extractive synthesis / civic-memory timeline
     -> clickable author-date citations
     -> optional query log / candidate-void log
 
-This version does not use an LLM API.
 
 Expected index directory
 ------------------------
@@ -85,7 +84,7 @@ DEFAULT_MAX_TIMELINE_EVENTS = 10
 DEFAULT_QUERY_LOG_FILE = "agent_query_log.jsonl"
 DEFAULT_VOID_LOG_FILE = "candidate_voids.jsonl"
 
-AGENT_VERSION = "1.1.0-extractive-voids"
+AGENT_VERSION = "1.2.0-extractive-civic-memory"
 
 # Optional domain -> author mapping used for clickable author-date citations.
 # Extend or replace this dictionary for another jurisdiction/corpus.
@@ -736,10 +735,151 @@ def clickable_citation(record, settings):
     return f"({label})"
 
 
-def build_timeline_answer(question, evidence_records, settings):
+
+def extract_event_date_text(sentence, record):
     """
-    Deterministic chronology built from retrieved sentences.
-    No free-form factual generation is used.
+    Extract a human-readable event date label from the sentence where possible.
+
+    Preference order:
+    1. Month + year explicitly stated in the sentence
+    2. Four-digit year explicitly stated in the sentence
+    3. Source/document metadata date
+    """
+    sentence = safe_text(sentence)
+
+    month_year = re.search(
+        r"\b("
+        r"January|February|March|April|May|June|July|August|"
+        r"September|October|November|December"
+        r")\s+((?:19|20)\d{2})\b",
+        sentence,
+        flags=re.IGNORECASE,
+    )
+
+    if month_year:
+        month = month_year.group(1).title()
+        year = month_year.group(2)
+        return f"{month} {year}"
+
+    year_match = re.search(
+        r"\b(?:19|20)\d{2}\b",
+        sentence,
+    )
+
+    if year_match:
+        return year_match.group(0)
+
+    metadata_date = (
+        safe_text(record.get("normalized_date", ""))
+        or safe_text(record.get("V01_Date", ""))
+    )
+
+    return metadata_date or "Date not specified"
+
+
+def classify_temporal_status(sentence, record, reference_dt=None):
+    """
+    Classify a retrieved event as past, present/current, or future/scheduled.
+
+    Explicit scheduling language is used for future events where possible.
+    Otherwise an extracted year is compared with the current year.
+
+    This remains a heuristic classification and does not infer dates that
+    are absent from the retrieved evidence.
+    """
+    if reference_dt is None:
+        reference_dt = datetime.now(timezone.utc)
+
+    lower = safe_text(sentence).lower()
+
+    future_signals = [
+        "scheduled",
+        "planned",
+        "expected",
+        "will begin",
+        "will start",
+        "will be",
+        "will continue",
+        "to begin",
+        "to start",
+        "future",
+        "upcoming",
+        "anticipated",
+        "targeted for",
+        "forecast",
+        "next phase",
+    ]
+
+    current_signals = [
+        "currently",
+        "is underway",
+        "are underway",
+        "underway",
+        "ongoing",
+        "in progress",
+        "current",
+        "now",
+    ]
+
+    explicit_years = re.findall(
+        r"\b(?:19|20)\d{2}\b",
+        safe_text(sentence),
+    )
+
+    if explicit_years:
+        event_year = int(explicit_years[0])
+
+        if event_year > reference_dt.year:
+            return "future"
+
+        if event_year < reference_dt.year:
+            return "past"
+
+        # Same-year events: language helps distinguish scheduled vs current/past.
+        if any(signal in lower for signal in future_signals):
+            return "future"
+
+        if any(signal in lower for signal in current_signals):
+            return "present"
+
+        return "present"
+
+    if any(signal in lower for signal in future_signals):
+        return "future"
+
+    if any(signal in lower for signal in current_signals):
+        return "present"
+
+    metadata_year = get_citation_year(record)
+
+    if metadata_year.isdigit():
+        event_year = int(metadata_year)
+
+        if event_year > reference_dt.year:
+            return "future"
+
+        if event_year < reference_dt.year:
+            return "past"
+
+        return "present"
+
+    return "present"
+
+
+def build_structured_timeline_events(
+    question,
+    evidence_records,
+    settings,
+):
+    """
+    Build structured civic-memory timeline events from retrieved evidence.
+
+    Each event keeps:
+    - temporal status
+    - extracted date label
+    - sortable year
+    - original evidence sentence
+    - source metadata / URL
     """
     events = []
     seen = set()
@@ -769,8 +909,22 @@ def build_timeline_answer(question, evidence_records, settings):
                     sentence,
                     record,
                 ),
-                "sentence": sentence,
+                "date_label": extract_event_date_text(
+                    sentence,
+                    record,
+                ),
+                "temporal_status": classify_temporal_status(
+                    sentence,
+                    record,
+                ),
+                "sentence": sentence.strip(),
                 "record": record,
+                "source_url": safe_text(
+                    record.get(
+                        "V13_SourceLink",
+                        "",
+                    )
+                ),
             })
 
     events.sort(
@@ -779,45 +933,81 @@ def build_timeline_answer(question, evidence_records, settings):
             safe_text(
                 item["record"].get(
                     "V01_Date",
-                    ""
+                    "",
                 )
             ),
         )
     )
 
-    events = events[:settings.max_timeline_events]
+    return events[:settings.max_timeline_events]
+
+
+def build_timeline_answer(question, evidence_records, settings):
+    """
+    Deterministic Civic Memory Timeline.
+
+    Retrieved events are organized as:
+        past -> present -> future/scheduled
+
+    Every event retains a clickable source citation.
+    No free-form factual generation is used.
+    """
+    events = build_structured_timeline_events(
+        question,
+        evidence_records,
+        settings,
+    )
 
     if not events:
         return (
-            "The available corpus does not contain enough "
-            "retrievable evidence to construct a timeline."
+            "The available public record is silent on this timeline question."
         )
 
-    lines = [
-        "The retrieved record shows the topic developing through a series of "
-        "planning, decision, implementation, and reporting steps rather "
-        "than a single event."
-    ]
+    groups = {
+        "past": [],
+        "present": [],
+        "future": [],
+    }
 
     for event in events:
-        sentence = event["sentence"].strip()
-        citation = clickable_citation(
-            event["record"],
-            settings,
-        )
+        groups[event["temporal_status"]].append(event)
 
-        lines.append(
-            f"{sentence} {citation}"
-        )
+    lines = [
+        "The retrieved public record can be organized as a civic-memory timeline "
+        "from past developments through the current record and scheduled future activity."
+    ]
+
+    section_labels = [
+        ("past", "PAST"),
+        ("present", "PRESENT / CURRENT"),
+        ("future", "FUTURE / SCHEDULED"),
+    ]
+
+    for key, label in section_labels:
+        if not groups[key]:
+            continue
+
+        lines.append(f"**{label}**")
+
+        for event in groups[key]:
+            citation = clickable_citation(
+                event["record"],
+                settings,
+            )
+
+            lines.append(
+                f"- **{event['date_label']}** — "
+                f"{event['sentence']} {citation}"
+            )
 
     lines.append(
-        "Taken together, these retrieved records show a progression from "
-        "planning and preliminary design, through more detailed design and "
-        "Council authorization, toward implementation-related work. "
-        "This summary reflects only the evidence retrieved from the current corpus."
+        "This timeline reflects only events supported by the retrieved corpus. "
+        "Future items are shown only where the retrieved record contains a future "
+        "date or scheduling/planning language."
     )
 
     return "\n\n".join(lines)
+
 
 
 def build_discursive_extractive_answer(
