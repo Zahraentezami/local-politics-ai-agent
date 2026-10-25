@@ -7,7 +7,7 @@ The `src` directory contains the core code used to build and maintain the **Loca
 | Source pathways and retrieval | `pathway_connectors_WELRT_v2.py` |
 | Metadata/codebook alignment | `pathway_connectors_WELRT_v2.py` |
 | Text normalization | `normalizer_script.py` |
-| Normalization quality control | `lnormalizer_script.py` |
+| Normalization quality control | `normalizer_script.py` |
 | Structural chunking | `retrieval_index.py` |
 | Chunk quality validation | `retrieval_index.py` |
 | Sentence-transformer embeddings | `retrieval_index.py` |
@@ -17,7 +17,7 @@ The `src` directory contains the core code used to build and maintain the **Loca
 | Query-intent reranking | `search_agent.py` |
 | Timeline evidence handling | `search_agent.py` |
 | Deterministic extractive answers | `search_agent.py` |
-| Clickable author-date citations | `earch_agent.py` |
+| Clickable author-date citations | `search_agent.py` |
 | Local search interface | `streamlit_app.py` |
 | Local Streamlit server settings | `.streamlit/config.toml` |
 | Dependency specification | `requirements.txt` |
@@ -322,13 +322,13 @@ These tests support inspection of:
 
 This retrieval functionality is primarily intended for **index validation**.
 
-The user-facing search and answer workflow is implemented separately in `civic_search_agent.py`.
+The user-facing search and answer workflow is implemented separately in `search_agent.py`.
 
 ---
 
 ## Evidence Retrieval and Reranking
 
-**Related script:** `civic_search_agent.py`
+**Related script:** `search_agent.py`
 
 The search-agent script loads an existing retrieval index and searches it using the same sentence-transformer model used to create the document embeddings.
 
