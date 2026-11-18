@@ -16,15 +16,16 @@ from datetime import datetime
 from pathlib import Path
 
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-INPUT_FILE = ""
+INPUT_FILE = "welrt_records.xlsx"
 
-OUTPUT_FILE = ""
+OUTPUT_FILE = "normalized_records.xlsx"
 
-OUTPUT_CSV = ""
+OUTPUT_CSV = "normalized_records.csv"
 
 
 # ============================================================
@@ -882,7 +883,7 @@ df["normalized_text_hash"] = df[
 # ============================================================
 
 df["normalization_version"] = (
-    NORMALIZATION_VERSION
+    'v2'
 )
 
 df["normalized_at"] = (
@@ -1035,7 +1036,7 @@ if len(duplicates) > 0:
         "\nPotential duplicate documents:"
     )
 
-    display(
+    (
         duplicates[
             [
                 "V04_Title",
@@ -1094,7 +1095,7 @@ if len(review_df) > 0:
         "have one or more review flags."
     )
 
-    display(
+    (
         review_df[
             [
                 "V04_Title",
@@ -1115,7 +1116,7 @@ print(
     "\nSample before / after normalization:"
 )
 
-display(
+(
     df[
         [
             "V04_Title",

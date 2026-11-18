@@ -8,6 +8,7 @@ import csv
 import os
 import io
 import pandas as pd
+import pymupdf as fitz
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -28,7 +29,7 @@ TOPIC_KEYWORDS = [
 ]
 
 
-EXCEL_PATH = "" # insert file name here
+EXCEL_PATH = "Torontos_Waterfront_East_LRT.xlsx" # insert file name here
 EXCEL_SHEET = "Numerical Codes"
 
 
@@ -603,7 +604,7 @@ def normalize_date_time(raw_value) -> tuple[Optional[str], Optional[str]]:
 class Record:
     V01_Date: Optional[str] = None
     V02_Publish_Time: Optional[str] = None
-    V03_Capture_Time: str = field(default_factory=lambda: dt.datetime.utcnow().isoformat())
+    V03_Capture_Time: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
     V04_Title: str = ""
     V05_Language: int = 1
     V06_PolicyStage: Optional[int] = None
@@ -1217,12 +1218,14 @@ if __name__ == "__main__":
     all_records = run_all_pathways()
     print(f"\nEmitted {len(all_records)} total Codebook-conformant records for topic={TOPIC_TAG}")
 
-
     json_path = os.path.join(os.getcwd(), "welrt_records.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(all_records, f, indent=2, ensure_ascii=False)
-    print(f"Wrote {json_path}")
+    temp_path = json_path + ".tmp"
 
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(all_records, f, indent=2, ensure_ascii=False)
+
+    os.replace(temp_path, json_path)
+    print(f"Wrote {json_path}")
 
     # Write XLSX instead of CSV
     if all_records:

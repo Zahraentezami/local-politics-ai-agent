@@ -15,6 +15,7 @@ Expected files:
 from pathlib import Path
 
 import streamlit as st
+import json
 
 from civic_search_agent import (
     Settings,
@@ -264,6 +265,143 @@ def show_evidence(evidence):
                     f"[Open original source]({source_url})"
                 )
 
+WELRT_RECORDS_PATH = Path(__file__).resolve().with_name("welrt_records.json")
+
+
+def load_welrt_snapshot(path: Path) -> dict:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError("Expected a list of source records.")
+
+    snapshot = {}
+
+    for row in rows:
+        tier = str(row.get("V16_Tier") or "").casefold()
+        if "failed" in tier or "robots-blocked" in tier:
+            continue
+
+        url = str(row.get("V13_SourceLink") or "").strip()
+        if not url.startswith(("https://", "http://")):
+            continue
+
+        # Strip only a dangling '?' or fragment; preserve ?item=YYYY.EX...
+        record_id = url.split("#", 1)[0].rstrip("?")
+        title = str(row.get("V04_Title") or record_id)
+        vote = row.get("vote_record")
+
+        snapshot[record_id] = {
+            "title": title,
+            "url": record_id,
+            "claim": " ".join(str(row.get("V09_VerifiedClaim") or "").split()),
+            "text": " ".join(str(row.get("raw_text") or "").split()),
+            "vote": vote,
+        }
+
+    return snapshot
+
+
+ISSUE_FEEDS = {
+    "waterfront-east-lrt": {
+        "label": "Waterfront East LRT",
+        "path": WELRT_RECORDS_PATH,
+    },
+    # Add more entries here when their JSON feeds are ready.
+}
+
+
+def check_issue_feed(issue, watch):
+    try:
+        current = load_welrt_snapshot(issue["path"])
+    except (OSError, ValueError) as exc:
+        st.warning(f"Could not check {issue['label']}: {exc}")
+        return None
+
+    added = 0
+
+    for record_id, record in current.items():
+        previous = watch["seen"].get(record_id)
+
+        if previous is None:
+            event = "New record"
+        elif record == previous:
+            continue
+        elif record["vote"] and record["vote"] != previous["vote"]:
+            event = (
+                "Vote details updated" if previous["vote"]
+                else "Vote details added"
+            )
+        else:
+            event = "Updated record"
+
+        watch["unread"].append((event, record["title"], record["url"]))
+        added += 1
+
+    # Keep the last successful version if a source is missing in this run.
+    watch["seen"].update(current)
+    return added
+
+
+def render_issue_alerts():
+    watches = st.session_state.setdefault("configured_issue_watches", {})
+
+    with st.sidebar:
+        st.divider()
+        st.header("Issue alerts")
+
+        issue_id = st.selectbox(
+            "Issue or initiative",
+            options=list(ISSUE_FEEDS),
+            format_func=lambda key: ISSUE_FEEDS[key]["label"],
+            key="configured_issue_picker",
+        )
+        issue = ISSUE_FEEDS[issue_id]
+
+        if issue_id in watches:
+            st.caption(f"Following {issue['label']}")
+        elif st.button("Follow this issue", key="configured_issue_follow"):
+            try:
+                baseline = load_welrt_snapshot(issue["path"])
+            except (OSError, ValueError) as exc:
+                st.warning(f"Could not follow {issue['label']}: {exc}")
+            else:
+                watches[issue_id] = {"seen": baseline, "unread": []}
+                st.rerun()
+
+        active_ids = [key for key in watches if key in ISSUE_FEEDS]
+
+        if st.button(
+            "Check for source updates",
+            key="configured_issue_check",
+            disabled=not active_ids,
+        ):
+            for key in active_ids:
+                feed = ISSUE_FEEDS[key]
+                added = check_issue_feed(feed, watches[key])
+                if added is not None:
+                    st.caption(f"{feed['label']}: {added} new alerts.")
+
+        for key in active_ids:
+            watch = watches[key]
+            label = ISSUE_FEEDS[key]["label"]
+            unread = watch["unread"]
+
+            with st.expander(f"{label} · {len(unread)} unread"):
+                if st.button("Unfollow", key=f"configured_unfollow:{key}"):
+                    del watches[key]
+                    st.rerun()
+
+                if not unread:
+                    st.caption("No unread alerts.")
+                elif st.button("Mark as read", key=f"configured_read:{key}"):
+                    unread.clear()
+                    st.rerun()
+
+                for event, title, url in reversed(unread):
+                    st.text(f"{event} · {title}")
+                    st.link_button("Open source", url)
+
+
+render_issue_alerts()
 
 # ============================================================
 # SIDEBAR SETTINGS
