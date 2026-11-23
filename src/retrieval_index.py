@@ -47,8 +47,8 @@ import faiss
 # CONFIGURATION
 # ============================================================
 
-INPUT_FILE = "normalized_records.xlsx"
-OUTPUT_DIR = "/retrieval_index"
+INPUT_FILE = ""
+OUTPUT_DIR = ""
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 

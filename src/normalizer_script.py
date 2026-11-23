@@ -21,11 +21,11 @@ from pathlib import Path
 # CONFIGURATION
 # ============================================================
 
-INPUT_FILE = "welrt_records.xlsx"
+INPUT_FILE = ""
 
-OUTPUT_FILE = "normalized_records.xlsx"
+OUTPUT_FILE = ""
 
-OUTPUT_CSV = "normalized_records.csv"
+OUTPUT_CSV = ""
 
 
 # ============================================================
